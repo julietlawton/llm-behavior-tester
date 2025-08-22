@@ -79,9 +79,15 @@ if selected_models:
 
     with generate_dataset_tab:
         default_model = "openai/gpt-oss-20b:free"
-        all_models = models_df["id"][models_df["id"] != default_model].values
+        all_models = models_df[models_df["id"] != default_model]
+        all_models = all_models["id"][
+            all_models["supported_parameters"].apply(
+                lambda params: isinstance(params, list) and "structured_outputs" in params
+            )
+        ].values
+
         model_options = [default_model] + list(all_models)
-        num_prompts = st.number_input("Number of prompts to generate:", value=10, min_value=1, max_value=1000)
+        num_prompts = st.number_input("Number of prompts to generate:", value=10, min_value=1, max_value=100)
 
         model_selection = st.selectbox(
             "Prompt generation model:",
@@ -117,9 +123,11 @@ if selected_models:
             else:
                 prompt_res = requests.post(
                     url="http://127.0.0.1:8000/generate_prompts/", 
-                    params={
+                    json={
                         "model_id": model_selection,
                         "experiment_description": dataset_gen_prompt, 
+                    },
+                    params={
                         "n": num_prompts
                     }
                 )
@@ -135,3 +143,8 @@ if selected_models:
 
 if experiment_df is not None:
     st.subheader("Step 3. Set Up Experiment")
+    # for index, row in filtered_df.iterrows():
+    #     st.write(row)
+    #     st.write(row["id"])
+        
+    st.button("Run Experiment")
