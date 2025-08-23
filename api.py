@@ -3,6 +3,7 @@ import json
 import os
 import httpx
 import requests
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Union
 from dotenv import load_dotenv
@@ -49,12 +50,14 @@ class PromptWorker:
         queue (asyncio.Queue[int]): Queue of batch sizes to process.
         results (List[str]): Shared list for collecting generated prompts.
         usage (List[int]): Shared list for collecting usage costs.
+        errors (List[str]): Shared list for collecting error messages if workers fail.
         request (GenerationRequest): Experiment description and model info.
     """  
     name: str
     queue: asyncio.Queue[int]
     results: List[str]
     usage: List[float]
+    errors: List[str]
     request: GenerationRequest
     # max_retries: int
     
@@ -65,11 +68,23 @@ class PromptWorker:
             n = await self.queue.get()
             print(f"Worker {self.name} taking job {n}")
             try:
-                result = await generate_prompts(self.request, n)
+                result = await asyncio.wait_for(generate_prompts(self.request, n), timeout=120)
                 self.results.extend(result["prompts"]["items"])
                 self.usage.append(float(result["usage"]))
+            except asyncio.TimeoutError as e:
+                msg = f"[{self.name}] exited with error: Timeout error."
+                print(msg)
+                self.errors.append({"worker": self.name, "code": 504, "message": "Request timed out."})
             except Exception as e:
-                print(f"[{self.name}] error: {repr(e)}")
+                msg = f"[{self.name}] exited with error: {repr(e)}"
+                print(msg)
+                detail = None
+                try:
+                    detail = e.detail["error"]["message"]
+                except Exception:
+                    detail = repr(e)
+
+                self.errors.append({"worker": self.name, "code": e.status_code, "message": detail})
             finally:
                 self.queue.task_done()
 
@@ -130,13 +145,14 @@ async def generate_prompts(
             {
                 "role": "system",
                 "content": (
-                    "You are an assistant generating high-quality evaluation prompts "
+                    "You are an assistant generating high-quality evaluation user prompts "
                     "for testing specific capabilities of language models based on the "
                     "user experiment description.\n"
                     "- Interpret the description to identify the behavior(s) to test and any constraints.\n"
                     "- Create standalone prompts that directly test those behaviors.\n"
                     "- Ensure variation along multiple axes (length, explicitness, disclaimers, context, detail).\n"
                     "- Ensure diversity of language."
+                    "- Do not include references to the experiment or this prompt."
                 ),
             },
             {"role": "user", "content": request.experiment_description},
@@ -164,7 +180,12 @@ async def generate_prompts(
         return {"prompts": prompts, "usage": usage}
     
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError:
@@ -182,7 +203,12 @@ async def list_models() -> dict:
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError:
@@ -202,10 +228,16 @@ async def check_key() -> dict:
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}"
             }
         )
+
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.json)
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError:
@@ -234,8 +266,7 @@ async def fetch_prompts(
         
     queue = asyncio.Queue()
     
-    results = []
-    usage = []
+    results, usage, errors = [], [], []
 
     for b in batches:
         print("Adding job to queue")
@@ -245,13 +276,23 @@ async def fetch_prompts(
     n_workers = min(len(batches), max_workers) 
     workers = [
         asyncio.create_task(
-            PromptWorker(f"w{i}", queue, results, usage, request).run()
+            PromptWorker(f"w{i}", queue, results, usage, errors, request).run()
         ) for i in range(n_workers)
     ]
     
     await queue.join()
     for w in workers:
         w.cancel()
+    
+    # All jobs failed
+    if not results:
+        code = errors[0]["code"]
+        message = errors[0]["message"]
+        raise HTTPException(status_code=code, detail=message)
+      
+    # Partial success - some jobs failed  
+    if errors:
+        return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage), "errors": errors})
 
     return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage)})
 
@@ -323,7 +364,12 @@ async def generate(input: str, max_completion_tokens: int | None = None):
             }
         )
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError:
