@@ -69,7 +69,9 @@ class PromptWorker:
             print(f"Worker {self.name} taking job {n}")
             try:
                 result = await asyncio.wait_for(generate_prompts(self.request, n), timeout=120)
-                self.results.extend(result["prompts"]["items"])
+                for _, prompt in result["prompts"].items():
+                    self.results.append({"user": prompt})
+                    
                 self.usage.append(float(result["usage"]))
             except asyncio.TimeoutError as e:
                 msg = f"[{self.name}] exited with error: Timeout error."
@@ -80,7 +82,12 @@ class PromptWorker:
                 print(msg)
                 detail = None
                 try:
-                    detail = e.detail["error"]["message"]
+                    error_props = e.detail["error"]
+                    if "metadata" in error_props:
+                        detail = e.detail["error"]
+                    else:
+                        detail = e.detail["error"]["message"]
+            
                 except Exception:
                     detail = repr(e)
 
@@ -98,29 +105,24 @@ def build_prompt_schema(n: int) -> dict:
     Returns:
         dict: JSON Schema requiring exactly `n` user prompts.
     """   
+    properties = {
+        f"prompt_{i}": {
+            "type": "string",
+            "description": f"User prompt fitting the experiment specifications #{i}."
+        }
+        for i in range(1, n + 1)
+    }
+    required = [f"prompt_{i}" for i in range(1, n+1)]
+    
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "promptgen",
+            "name": "prompt_schema",
             "strict": True,
             "schema": {
                 "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "minItems": n,
-                        "maxItems": n,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "user": {"type": "string", "minLength": 1},
-                            },
-                            "required": ["user"],
-                            "additionalProperties": False,
-                        },
-                    }
-                },
-                "required": ["items"],
+                "properties": properties,
+                "required": required,
                 "additionalProperties": False,
             },
         },
@@ -150,10 +152,11 @@ async def generate_prompts(
                     "user experiment description.\n"
                     "- Interpret the description to identify the behavior(s) to test and any constraints.\n"
                     "- Create standalone prompts that directly test those behaviors.\n"
+                    "- Create EXACTLY {n} prompts."
                     "- Ensure variation along multiple axes (length, explicitness, disclaimers, context, detail).\n"
                     "- Ensure diversity of language."
                     "- Do not include references to the experiment or this prompt."
-                ),
+                ).format(n=n),
             },
             {"role": "user", "content": request.experiment_description},
         ],
@@ -246,7 +249,7 @@ async def check_key() -> dict:
 @app.post("/generate_prompts/")
 async def fetch_prompts(
     request: GenerationRequest,
-    n: int = Query(description="Number of prompts to generate", le=100)):
+    n: int = Query(description="Number of prompts to generate", le=100)) -> dict:
     # max_retries: int = Query(description="Number of times to retry failed jobs", ge=0, le=5)):
     """Create prompt generation job. Splits the requested number of prompts into batches, assigns them to
     workers, and aggregates results.
