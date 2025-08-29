@@ -1,9 +1,12 @@
 import asyncio
+import functools
+import random
 import asyncpg
 import json
 import os
 import httpx
 import re
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 from dotenv import load_dotenv
@@ -15,6 +18,28 @@ from contextlib import asynccontextmanager
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+def retry_with_backoff(retries: int = 3):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            initial_sleep = 0.5
+            max_sleep = 10
+            for attempt in range(1, retries+1):
+                try:
+                    return await func(*args, **kwargs)
+                except HTTPException as e:
+                    print(f"Attempt {attempt} failed")
+                    if e.status_code not in {408, 429, 500, 502, 503, 504} or attempt == retries:
+                        raise
+                    
+                    sleep = min(initial_sleep * (2 ** attempt - 1), max_sleep)
+                    sleep += random.uniform(0, sleep * 0.1)
+                    print(f"Retrying in {sleep:.2f} seconds...")
+                    await asyncio.sleep(sleep)
+            return
+        return wrapper
+    return decorator
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,6 +91,7 @@ class EvaluatorConfig(BaseModel):
 class ExperimentRequest(BaseModel):
     dataset: List[DatasetRow]
     model_configs: Dict[str, Dict[str, Any]]
+    evaluator_model_id: str
     evaluator_type: Literal["structured", "free"]
     evaluator_config: EvaluatorConfig
     
@@ -111,30 +137,45 @@ class ExperimentWorker:
 
                     if row["prev_state"] == "pending":
                         print(f"{self.name} executing generate response")
-                        model_response = await asyncio.wait_for(
-                            generate_response(
+                        try:
+                            model_response = await generate_response(
                                 row["model_id"],
                                 row["user_prompt"],
                                 row["system_prompt"]
-                            ), 
-                            timeout=60
-                        )
-                        print(model_response)
-
-                            
-                        async with app.state.pool.acquire() as conn:
-                            await conn.execute(
-                                """
-                                UPDATE jobs
-                                SET model_response = $1,
-                                    usage = usage + $2,
-                                    job_status = 'awaiting_eval'
-                                WHERE id = $3
-                                """,
-                                model_response["response"],
-                                model_response["usage"],
-                                row["id"]
                             )
+
+                        except Exception as e:
+                            print(f"{self.name} job failed: {e}")
+                            error_log = json.dumps([{
+                                "time": datetime.now().isoformat(),
+                                "error": str(e),
+                                "worker": self.name,
+                            }])
+                            async with app.state.pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE jobs
+                                    SET error_log = error_log || $1::jsonb,
+                                        job_status = 'failed'
+                                    WHERE id = $2
+                                    """,
+                                    error_log,
+                                    row["id"]
+                                )
+                        else:
+                            async with app.state.pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE jobs
+                                    SET model_response = $1,
+                                        usage = usage + $2,
+                                        job_status = 'awaiting_eval'
+                                    WHERE id = $3
+                                    """,
+                                    model_response["response"],
+                                    model_response["usage"],
+                                    row["id"]
+                                )
 
                     elif row["prev_state"] == "awaiting_eval":
                         print(f"{self.name} executing eval")
@@ -142,33 +183,55 @@ class ExperimentWorker:
                         async with app.state.pool.acquire() as conn:
                             evaluator_details = await conn.fetchrow(
                                 """
-                                SELECT evaluator_type, evaluator_config
+                                SELECT evaluator_type, evaluator_config, evaluator_model_id
                                 FROM experiments
                                 WHERE id = $1
                                 """, row["experiment_id"]
                             )
+                            evaluator_model_id = evaluator_details["evaluator_model_id"]
                             evaluator_type = evaluator_details["evaluator_type"]
                             evaluator_config = json.loads(evaluator_details["evaluator_config"])
                             evaluator_prompt, possible_labels = evaluator_config["evaluator_prompt"], evaluator_config["possible_labels"]
-                            
-                        try:
-                            
-                            evaluator_response = await asyncio.wait_for(
-                                evaluate_response(
-                                    "openai/gpt-4o",
-                                    evaluator_type,
-                                    evaluator_prompt,
-                                    possible_labels,
-                                    model_response["response"],
-                                    row["target_response"]
-                                ), 
-                                timeout=60
-                            )
-                            print(evaluator_response)
                         
-                        except Exception as e:
-                            print(e)
+                        async with app.state.pool.acquire() as conn:
+                            model_output = await conn.fetchrow(
+                                """
+                                SELECT model_response
+                                FROM jobs
+                                WHERE id = $1
+                                """, row["id"]
+                            )
+                            model_response = model_output["model_response"]
+                            
                         try:
+                            evaluator_response = await evaluate_response(
+                                evaluator_model_id,
+                                evaluator_type,
+                                evaluator_prompt,
+                                possible_labels,
+                                model_response,
+                                row["target_response"]
+                            )
+                        except Exception as e:
+                            print(f"{self.name} job failed: {e}")
+                            error_log = json.dumps([{
+                                "time": datetime.now().isoformat(),
+                                "error": str(e),
+                                "worker": self.name,
+                            }])
+                            async with app.state.pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE jobs
+                                    SET error_log = error_log || $1::jsonb,
+                                        job_status = 'failed'
+                                    WHERE id = $2
+                                    """,
+                                    error_log,
+                                    row["id"]
+                                )
+                        else:
+                            print(f"{self.name}: job completed")
                             async with app.state.pool.acquire() as conn:
                                 await conn.execute(
                                     """
@@ -183,10 +246,7 @@ class ExperimentWorker:
                                     evaluator_response["eval_justification"],
                                     evaluator_response["usage"],
                                     row["id"]
-                                )
-                        except Exception as e:
-                            print(e)
-                            
+                                )                        
             except Exception as e:
                 print(e)
                                     
@@ -279,7 +339,8 @@ def build_prompt_schema(n: int) -> dict:
             },
         },
     }
-    
+
+@retry_with_backoff()    
 async def generate_response(
     model_id: str, 
     user_prompt: str, 
@@ -309,7 +370,6 @@ async def generate_response(
         data = r.json()
         response = data["choices"][0]["message"]["content"]
         usage = data["usage"]["cost"]
-
         return {"response": response, "usage": usage}
     
     except httpx.HTTPStatusError as e:
@@ -324,6 +384,7 @@ async def generate_response(
     except ValueError:
         raise HTTPException(status_code=502, detail="Invalid JSON")
 
+@retry_with_backoff()
 async def evaluate_response(
     evaluator_model_id: str, 
     evaluator_type: Literal["structured", "free"], 
@@ -440,8 +501,9 @@ async def evaluate_response(
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(status_code=502, detail=str(e))
 
+@retry_with_backoff()
 async def generate_prompts(
     request: PromptGenerationRequest,
     n: int) -> dict:
@@ -623,9 +685,10 @@ async def start_experiment():
     with open("experiment_request.json") as f:
         data = json.load(f)
         request = ExperimentRequest(**data)
-    
+
     dataset_json = [row.model_dump(exclude_none=True) for row in request.dataset]
     models_json = request.model_configs
+    evaluator_model_id = request.evaluator_model_id
     evaluator_json = request.evaluator_config.model_dump(exclude_none=True)
 
     async with app.state.pool.acquire() as conn:
@@ -633,12 +696,13 @@ async def start_experiment():
             async with conn.transaction():
                 experiment_id = await conn.fetchval(
                     """
-                    INSERT INTO experiments (dataset, models, evaluator_type, evaluator_config)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO experiments (dataset, models, evaluator_model_id, evaluator_type, evaluator_config)
+                    VALUES ($1, $2, $3, $4, $5)
                     RETURNING id
                     """,
                     json.dumps(dataset_json),
                     json.dumps(models_json),
+                    evaluator_model_id,
                     request.evaluator_type,
                     json.dumps(evaluator_json),
                 )
