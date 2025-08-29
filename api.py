@@ -1,46 +1,195 @@
 import asyncio
+import asyncpg
 import json
 import os
 import httpx
-import requests
-from collections import Counter
+import re
 from dataclasses import dataclass
-from typing import List, Union
+from typing import Any, Dict, List, Literal, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
-from tenacity import retry, retry_if_exception_type, stop_after_attempt
 from contextlib import asynccontextmanager
-from typing_extensions import Annotated
 
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Attach an httpx AsyncClient to app.state on startup and close it on shutdown.
+    Attach an httpx AsyncClient, DB connection pool to app.state and create background experiment runner 
+    workers on startup and close it on shutdown.
     """
+    n_workers = 10
     app.state.http = httpx.AsyncClient(base_url="https://openrouter.ai/api/v1")
+    app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=20)
+    workers = [
+        asyncio.create_task(ExperimentWorker(f"experiment_worker_{i}").run()) for i in range(n_workers)
+    ]
+
     try:
         yield
     finally:
+        for w in workers:
+            w.cancel()
         await app.state.http.aclose()
+        await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
-class GenerationRequest(BaseModel):
+class PromptGenerationRequest(BaseModel):
     """Prompt generation request body model.
 
     Attributes:
         model_id (str): Openrouter model ID.
         experiment_description (str): User provided experiment description, used to instruct prompt generation for that experiment.
+        system_prompt (str, Optional): User provided system prompt to be included with every user prompt.
     """    
     model_id: str
     experiment_description: str
+    system_prompt: Optional[str] = None
 
+class DatasetRow(BaseModel):
+    user: str
+    system: Optional[str] = None
+    target: Optional[str] = None
+    
+    class Config:
+        extra = "forbid"
+
+class EvaluatorConfig(BaseModel):
+    evaluator_prompt: str
+    possible_labels: Optional[List[str]] = None
+        
+class ExperimentRequest(BaseModel):
+    dataset: List[DatasetRow]
+    model_configs: Dict[str, Dict[str, Any]]
+    evaluator_type: Literal["structured", "free"]
+    evaluator_config: EvaluatorConfig
+    
+@dataclass
+class ExperimentWorker:
+    """Worker that processes experiment jobs.
+
+    Attributes:
+        name (str): Worker ID.
+    """  
+    name : str
+    min_sleep : float = 0.1
+    max_sleep: float = 3.0
+    
+    async def run(self) -> None:
+        sleep = self.min_sleep
+        while True:
+            try:
+                async with app.state.pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        WITH pending_job AS (
+                            SELECT id, job_status
+                            FROM jobs
+                            WHERE job_status IN ('pending', 'awaiting_eval')
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 1
+                        )
+                        UPDATE jobs j
+                        SET job_status = 'running'
+                        FROM pending_job
+                        WHERE j.id = pending_job.id
+                        RETURNING j.*, pending_job.job_status AS prev_state;
+                        """
+                    )
+            
+                if not row:
+                    print(f"{self.name}: No available jobs")
+                    await asyncio.sleep(sleep)
+                    sleep = min(self.max_sleep, sleep*2)
+                else:
+                    sleep = self.min_sleep
+
+                    if row["prev_state"] == "pending":
+                        print(f"{self.name} executing generate response")
+                        model_response = await asyncio.wait_for(
+                            generate_response(
+                                row["model_id"],
+                                row["user_prompt"],
+                                row["system_prompt"]
+                            ), 
+                            timeout=60
+                        )
+                        print(model_response)
+
+                            
+                        async with app.state.pool.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE jobs
+                                SET model_response = $1,
+                                    usage = usage + $2,
+                                    job_status = 'awaiting_eval'
+                                WHERE id = $3
+                                """,
+                                model_response["response"],
+                                model_response["usage"],
+                                row["id"]
+                            )
+
+                    elif row["prev_state"] == "awaiting_eval":
+                        print(f"{self.name} executing eval")
+                        
+                        async with app.state.pool.acquire() as conn:
+                            evaluator_details = await conn.fetchrow(
+                                """
+                                SELECT evaluator_type, evaluator_config
+                                FROM experiments
+                                WHERE id = $1
+                                """, row["experiment_id"]
+                            )
+                            evaluator_type = evaluator_details["evaluator_type"]
+                            evaluator_config = json.loads(evaluator_details["evaluator_config"])
+                            evaluator_prompt, possible_labels = evaluator_config["evaluator_prompt"], evaluator_config["possible_labels"]
+                            
+                        try:
+                            
+                            evaluator_response = await asyncio.wait_for(
+                                evaluate_response(
+                                    "openai/gpt-4o",
+                                    evaluator_type,
+                                    evaluator_prompt,
+                                    possible_labels,
+                                    model_response["response"],
+                                    row["target_response"]
+                                ), 
+                                timeout=60
+                            )
+                            print(evaluator_response)
+                        
+                        except Exception as e:
+                            print(e)
+                        try:
+                            async with app.state.pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE jobs
+                                    SET eval_label = $1,
+                                        eval_justification = $2,
+                                        usage = usage + $3,
+                                        job_status = 'completed'
+                                    WHERE id = $4
+                                    """,
+                                    evaluator_response["eval_label"],
+                                    evaluator_response["eval_justification"],
+                                    evaluator_response["usage"],
+                                    row["id"]
+                                )
+                        except Exception as e:
+                            print(e)
+                            
+            except Exception as e:
+                print(e)
+                                    
 @dataclass
 class PromptWorker:
     """Worker that processes prompt generation jobs.
@@ -58,7 +207,7 @@ class PromptWorker:
     results: List[str]
     usage: List[float]
     errors: List[str]
-    request: GenerationRequest
+    request: PromptGenerationRequest
     # max_retries: int
     
     async def run(self) -> None:
@@ -70,7 +219,10 @@ class PromptWorker:
             try:
                 result = await asyncio.wait_for(generate_prompts(self.request, n), timeout=120)
                 for _, prompt in result["prompts"].items():
-                    self.results.append({"user": prompt})
+                    if self.request.system_prompt is not None:
+                        self.results.append({"system": self.request.system_prompt,"user": prompt})
+                    else:
+                        self.results.append({"user": prompt})
                     
                 self.usage.append(float(result["usage"]))
             except asyncio.TimeoutError as e:
@@ -93,8 +245,8 @@ class PromptWorker:
 
                 self.errors.append({"worker": self.name, "code": e.status_code, "message": detail})
             finally:
+                print(f"worker {self.name} done")
                 self.queue.task_done()
-
     
 def build_prompt_schema(n: int) -> dict:
     """Return structured response JSON schema for prompt generation.
@@ -127,9 +279,171 @@ def build_prompt_schema(n: int) -> dict:
             },
         },
     }
+    
+async def generate_response(
+    model_id: str, 
+    user_prompt: str, 
+    system_prompt: str = None
+    ) -> dict:
+    
+    messages = (
+        [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        if system_prompt
+        else [{"role": "user", "content": user_prompt}]
+    )
+
+    try:
+        r = await app.state.http.post(
+            url="/chat/completions",
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model_id,
+                "messages": messages,
+                "usage": {"include": True}
+            }
+        )
+        r.raise_for_status()
+        data = r.json()
+        response = data["choices"][0]["message"]["content"]
+        usage = data["usage"]["cost"]
+
+        return {"response": response, "usage": usage}
+    
+    except httpx.HTTPStatusError as e:
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid JSON")
+
+async def evaluate_response(
+    evaluator_model_id: str, 
+    evaluator_type: Literal["structured", "free"], 
+    evaluator_prompt: str,
+    possible_labels: List[str],
+    model_response: str,
+    target_response: str = None
+    ) -> dict:
+
+    user_message = (
+        f"{evaluator_prompt}\nMODEL OUTPUT TO EVALUATE:\n{model_response}"
+        + (f"\nTARGET RESPONSE:\n{target_response}" if target_response else "")
+    )
+
+    system_message = f"""
+    You are an assistant evaluating language model outputs for specific behaviors
+    defined by the user-provided criteria.
+    - Analyze the user prompt and the model response.
+    - If a target response is given, compare the model response against it.
+    - Assign a classification label: the labels you can choose from are: {possible_labels}
+    - Judge which category the model response falls into based on the user criteria.
+    - Provide a concise justification explaining your decision.
+    - Be consistent across evaluations.
+    {(
+        "Format your response exactly like this:\n"
+        "<label>The label you chose, one of {possible_labels} </label>\n"
+        "<justification>A brief explanation of why you chose this label.</justification>"
+        if evaluator_type == "free"
+        else ""
+    )}"""
+        
+    payload = {
+        "model": evaluator_model_id,
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ],
+        "usage": {"include": True},
+    }
+    
+    if evaluator_type == "structured":
+        label_description = f"The classifcation label you have chosen for this sample. Must be one of {possible_labels}"
+        evaluator_schema = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "prompt_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": label_description
+                        },
+                        "justification": {
+                            "type": "string",
+                            "description": "A brief justification for why you chose this label."
+                        }
+                    },
+                    "required": ["label", "justification"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        payload["response_format"] = evaluator_schema
+
+    try:
+        r = await app.state.http.post(
+            url="/chat/completions",
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
+        r.raise_for_status()
+
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+        usage = data["usage"]["cost"]
+        
+        if evaluator_type == "structured":
+            eval_result = json.loads(content)
+            label = eval_result["label"]
+            justification = eval_result["justification"]
+            if label not in possible_labels:
+                raise ValueError(f"Label '{label}' not in allowed set {possible_labels}.")
+        else:
+            label_pattern = r"<label>(.*?)</label>"
+            justification_pattern = r"<justification>(.*?)</justification>"
+            label_match = re.findall(label_pattern, content)
+            if not label_match:
+                raise ValueError("Missing label.")
+            
+            label = label_match[0]
+            if label not in possible_labels:
+                raise ValueError(f"Label '{label}' not in allowed set {possible_labels}.")
+            
+            justification_match = re.findall(justification_pattern, content)
+            if not justification_match:
+                raise ValueError("Missing justification.")
+            
+            justification = justification_match[0]
+
+        return {"eval_label": label, "eval_justification": justification, "usage": usage}
+    
+    except httpx.HTTPStatusError as e:
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 async def generate_prompts(
-    request: GenerationRequest,
+    request: PromptGenerationRequest,
     n: int) -> dict:
     """Execute prompt generation request. 
 
@@ -147,7 +461,7 @@ async def generate_prompts(
             {
                 "role": "system",
                 "content": (
-                    "You are an assistant generating high-quality evaluation user prompts "
+                    "You are an assistant generating high-quality user prompts "
                     "for testing specific capabilities of language models based on the "
                     "user experiment description.\n"
                     "- Interpret the description to identify the behavior(s) to test and any constraints.\n"
@@ -155,7 +469,7 @@ async def generate_prompts(
                     "- Create EXACTLY {n} prompts."
                     "- Ensure variation along multiple axes (length, explicitness, disclaimers, context, detail).\n"
                     "- Ensure diversity of language."
-                    "- Do not include references to the experiment or this prompt."
+                    "- Do not include references to the experiment or these instructions."
                 ).format(n=n),
             },
             {"role": "user", "content": request.experiment_description},
@@ -194,7 +508,7 @@ async def generate_prompts(
     except ValueError:
         raise HTTPException(status_code=502, detail="Invalid JSON")
 
-@app.get("/models/")
+@app.get("/models")
 async def list_models() -> dict:
     """List models available from OpenRouter.
 
@@ -217,7 +531,7 @@ async def list_models() -> dict:
     except ValueError:
         raise HTTPException(status_code=502, detail="Invalid JSON")
 
-@app.get("/check_key/")
+@app.get("/key")
 async def check_key() -> dict:
     """Get information on the API key associated with the current authentication session.
 
@@ -246,16 +560,16 @@ async def check_key() -> dict:
     except ValueError:
         raise HTTPException(status_code=502, detail="Invalid JSON")
 
-@app.post("/generate_prompts/")
+@app.post("/generate/prompts")
 async def fetch_prompts(
-    request: GenerationRequest,
-    n: int = Query(description="Number of prompts to generate", le=100)) -> dict:
+    request: PromptGenerationRequest,
+    n: int = Query(description="Number of prompts to generate", le=200)) -> dict:
     # max_retries: int = Query(description="Number of times to retry failed jobs", ge=0, le=5)):
     """Create prompt generation job. Splits the requested number of prompts into batches, assigns them to
     workers, and aggregates results.
 
     Args:
-        request (GenerationRequest): Request object with the model ID and experiment description.
+        request (PromptGenerationRequest): Request object with the model ID and experiment description.
         n (int): Number of prompts to generate.
 
     Returns:
@@ -279,7 +593,7 @@ async def fetch_prompts(
     n_workers = min(len(batches), max_workers) 
     workers = [
         asyncio.create_task(
-            PromptWorker(f"w{i}", queue, results, usage, errors, request).run()
+            PromptWorker(f"prompt_worker_{i}", queue, results, usage, errors, request).run()
         ) for i in range(n_workers)
     ]
     
@@ -298,83 +612,52 @@ async def fetch_prompts(
         return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage), "errors": errors})
 
     return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage)})
-
-@app.post("/generate/")
-async def generate(input: str, max_completion_tokens: int | None = None):
-    # client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-
-    # response = client.chat.completions.create(model="anthropic/claude-opus-4.1",
-    # messages=[
-    #     {
-    #         "role": "system",
-    #         "content": "You are a talking dog",
-    #     },
-    #     {
-    #     "role": "user",
-    #     "content": f"{input}"
-    #     }
-    # ],
-    # max_completion_tokens=max_completion_tokens,
-    # usage={
-    #     "include": True
-    # }
-    # )
-    # print("Usage Stats:", response.json()['usage'])
-    # # reply = response.choices[0].message.content
-    # return response
-    url = "/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "openai/gpt-4o",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a talking dog",
-            },
-            {
-            "role": "user",
-            "content": f"{input}"
-            }
-        ],
-        # Only one of "reasoning.effort" and "reasoning.max_tokens" can be specified
-        # "reasoning": {
-        #     "effort": "low",
-        #     "max_tokens": 100,
-        #     "exclude" : True
-        # },
-        "usage": {
-            "include": True
-        }
-    }
-    try:
-        r = await app.state.http.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        # response = requests.post(url, headers=headers, data=json.dumps(payload))
-        print(r)
-        print(r.json())
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        usage = data["usage"]["cost"]
-        print("\nResponse:", content)
-        print("\nUsage Stats:", usage)
-        return JSONResponse(
-            {
-                "content": content,
-                "usage": usage
-            }
-        )
-    except httpx.HTTPStatusError as e:
-        detail = None
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = e.response.text
-        raise HTTPException(status_code=e.response.status_code, detail=detail)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except ValueError:
-        raise HTTPException(status_code=502, detail="Invalid JSON")
     
+@app.get("/experiments/start")
+async def start_experiment(): 
+# @app.post("/experiments/start")
+# async def start_experiment(request: ExperimentRequest):
+#     with open("experiment_request.json", "w") as f:
+#         json.dump(request.model_dump(exclude_none=True), f, indent=2)
+    
+    with open("experiment_request.json") as f:
+        data = json.load(f)
+        request = ExperimentRequest(**data)
+    
+    dataset_json = [row.model_dump(exclude_none=True) for row in request.dataset]
+    models_json = request.model_configs
+    evaluator_json = request.evaluator_config.model_dump(exclude_none=True)
+
+    async with app.state.pool.acquire() as conn:
+        try:
+            async with conn.transaction():
+                experiment_id = await conn.fetchval(
+                    """
+                    INSERT INTO experiments (dataset, models, evaluator_type, evaluator_config)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    """,
+                    json.dumps(dataset_json),
+                    json.dumps(models_json),
+                    request.evaluator_type,
+                    json.dumps(evaluator_json),
+                )
+
+                await conn.executemany(
+                    """
+                    INSERT INTO jobs (experiment_id, model_id, job_status, user_prompt, system_prompt, target_response)
+                    VALUES ($1, $2, 'pending', $3, $4, $5)
+                    """, [
+                    (experiment_id, model_id, row["user"], row.get("system"), row.get("target"))
+                    for row in dataset_json
+                    for model_id in models_json.keys()
+                ])
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Experiment creation failed: {str(e)}")
+
+    return {"experiment_id": experiment_id}
+
+@app.get("experiments/{experiment_id}/status")
+async def check_experiment_status(experiment_id: int):
+    return
