@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import logging
 import random
 import asyncpg
 import json
@@ -20,6 +21,18 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def retry_with_backoff(retries: int = 3):
+    """Decorator for retrying failed web requests with exponential backoff.
+    Retryable exceptions:
+    - 408: Request timed out.
+    - 429: Request was rate limited.
+    - 500: Internal server error.
+    - 502: Chosen model was down, or an invalid response was received.
+    - 503: No model provider available for this request. 
+    - 504: Gateway time out.
+
+    Args:
+        retries (int, Optional): Maximum number of retry attempts. Defaults to 3.
+    """
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -29,13 +42,11 @@ def retry_with_backoff(retries: int = 3):
                 try:
                     return await func(*args, **kwargs)
                 except HTTPException as e:
-                    print(f"Attempt {attempt} failed")
                     if e.status_code not in {408, 429, 500, 502, 503, 504} or attempt == retries:
                         raise
                     
                     sleep = min(initial_sleep * (2 ** attempt - 1), max_sleep)
                     sleep += random.uniform(0, sleep * 0.1)
-                    print(f"Retrying in {sleep:.2f} seconds...")
                     await asyncio.sleep(sleep)
             return
         return wrapper
@@ -44,31 +55,39 @@ def retry_with_backoff(retries: int = 3):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Attach an httpx AsyncClient, DB connection pool to app.state and create background experiment runner 
-    workers on startup and close it on shutdown.
+    Attach an httpx AsyncClient and DB connection pool to app.state and create background experiment 
+    worker tasks on startup. Close on shutdown.
     """
     n_workers = 10
-    app.state.http = httpx.AsyncClient(base_url="https://openrouter.ai/api/v1")
-    app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=20)
+    max_pool_size = 20
+    base_url = "https://openrouter.ai/api/v1"
+    
+    app.state.http = httpx.AsyncClient(base_url=base_url)
+    logger.info(f"Initialized HTTP client for OpenRouter base_url={base_url}.")
+    app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=max_pool_size)
+    logger.info(f"Created DB connection pool (max_size={max_pool_size}).")
     workers = [
-        asyncio.create_task(ExperimentWorker(f"experiment_worker_{i}").run()) for i in range(n_workers)
+        asyncio.create_task(ExperimentWorker(f"ExperimentWorker{i+1}").run()) for i in range(n_workers)
     ]
-
     try:
         yield
     finally:
         for w in workers:
             w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        logger.info("Closing HTTP client.")
         await app.state.http.aclose()
+        logger.info("Closing DB connection pool.")
         await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
+logger = logging.getLogger("uvicorn.error")
 
 class PromptGenerationRequest(BaseModel):
-    """Prompt generation request body model.
+    """Prompt generation request body.
 
     Attributes:
-        model_id (str): Openrouter model ID.
+        model_id (str): OpenRouter model ID.
         experiment_description (str): User provided experiment description, used to instruct prompt generation for that experiment.
         system_prompt (str, Optional): User provided system prompt to be included with every user prompt.
     """    
@@ -76,7 +95,14 @@ class PromptGenerationRequest(BaseModel):
     experiment_description: str
     system_prompt: Optional[str] = None
 
-class DatasetRow(BaseModel):
+class ExperimentDatasetRow(BaseModel):
+    """Schema for a single row in an experiment dataset.
+
+    Attributes:
+        user (str): User prompt for generating a model response to be evaluated.
+        system (str, Optional): Optional system prompt to be included with user prompt.
+        target (str, Optional): Optional ground truth to compare the model response against.
+    """ 
     user: str
     system: Optional[str] = None
     target: Optional[str] = None
@@ -85,22 +111,39 @@ class DatasetRow(BaseModel):
         extra = "forbid"
 
 class EvaluatorConfig(BaseModel):
+    """Evaluator config model. Defines the evaluator to be used for each job in the experiment.
+
+    Attributes:
+        evaluator_model_id (str): OpenRouter model ID for the model to be used as the evaluator.
+        evaluator_prompt (str): The user provided criteria for the evaluator.
+        target (List[str], Optional): Optional ground truth to compare the model response against.
+    """ 
+    evaluator_model_id: str
     evaluator_prompt: str
     possible_labels: Optional[List[str]] = None
         
 class ExperimentRequest(BaseModel):
-    dataset: List[DatasetRow]
+    """Experiment creation request body.
+
+    Args:
+        dataset (List[ExperimentDatasetRow]): Dataset for this experiment. Each prompt/model pair will be processed as one job.
+        model_configs (Dict[str, Dict[str, Any]]): Supported parameter configuration for each model to be tested.
+        evaluator_type (Literal["structured", "free"]): Evaluator type. Can be either 'structured' or 'free'.
+        evaluator_config (EvaluatorConfig): Configuration for the evaluator.
+    """
+    dataset: List[ExperimentDatasetRow]
     model_configs: Dict[str, Dict[str, Any]]
-    evaluator_model_id: str
     evaluator_type: Literal["structured", "free"]
     evaluator_config: EvaluatorConfig
     
 @dataclass
 class ExperimentWorker:
-    """Worker that processes experiment jobs.
+    """Worker that processes experiment jobs in the background while the service is running.
 
     Attributes:
         name (str): Worker ID.
+        min_sleep (float, Optional): Minimum amount of time this worker sleeps for (in seconds). Defaults to 0.1.
+        max_sleep (float, Optional): Maximum amount of time this worker sleeps for (in seconds). Defaults to 3.0.
     """  
     name : str
     min_sleep : float = 0.1
@@ -108,8 +151,10 @@ class ExperimentWorker:
     
     async def run(self) -> None:
         sleep = self.min_sleep
+        logger.info(f"[{self.name}] Worker is ready.")
         while True:
             try:
+                # Grab a job with pending work from the DB and mark it as running
                 async with app.state.pool.acquire() as conn:
                     row = await conn.fetchrow(
                         """
@@ -127,25 +172,32 @@ class ExperimentWorker:
                         RETURNING j.*, pending_job.job_status AS prev_state;
                         """
                     )
-            
+
+                # If there are no jobs available, sleep
                 if not row:
-                    print(f"{self.name}: No available jobs")
                     await asyncio.sleep(sleep)
                     sleep = min(self.max_sleep, sleep*2)
                 else:
                     sleep = self.min_sleep
-
+                    # If the job is marked as pending, generate a model response for the prompt
                     if row["prev_state"] == "pending":
-                        print(f"{self.name} executing generate response")
+                        logger.info(f"[{self.name}] Executing model response generation.")
                         try:
+                            model_config = json.loads(row["model_config"])
                             model_response = await generate_response(
                                 row["model_id"],
+                                model_config,
                                 row["user_prompt"],
                                 row["system_prompt"]
                             )
 
+                        # If the request failed, mark the job as failed
                         except Exception as e:
-                            print(f"{self.name} job failed: {e}")
+                            logger.error(
+                                f"[{self.name}] Executing model response generation failed. "
+                                f"{str(e)} "
+                                f"View job error log for more details."
+                            )
                             error_log = json.dumps([{
                                 "time": datetime.now().isoformat(),
                                 "error": str(e),
@@ -162,7 +214,13 @@ class ExperimentWorker:
                                     error_log,
                                     row["id"]
                                 )
+                        # If the response was generated successfully, add it to the job row and mark the
+                        # status as awaiting eval
                         else:
+                            logger.info(
+                                f"[{self.name}] Executing model response generation successful. "
+                                f"Updating job status to awaiting eval."
+                            )
                             async with app.state.pool.acquire() as conn:
                                 await conn.execute(
                                     """
@@ -177,22 +235,26 @@ class ExperimentWorker:
                                     row["id"]
                                 )
 
+                    # If job is marked as awaiting eval, run evaluation on it
                     elif row["prev_state"] == "awaiting_eval":
-                        print(f"{self.name} executing eval")
+                        logger.info(f"[{self.name}] Executing model response evaluation.")
                         
+                        # Load the evaluator details
                         async with app.state.pool.acquire() as conn:
                             evaluator_details = await conn.fetchrow(
                                 """
-                                SELECT evaluator_type, evaluator_config, evaluator_model_id
+                                SELECT evaluator_type, evaluator_config
                                 FROM experiments
                                 WHERE id = $1
                                 """, row["experiment_id"]
                             )
-                            evaluator_model_id = evaluator_details["evaluator_model_id"]
                             evaluator_type = evaluator_details["evaluator_type"]
                             evaluator_config = json.loads(evaluator_details["evaluator_config"])
-                            evaluator_prompt, possible_labels = evaluator_config["evaluator_prompt"], evaluator_config["possible_labels"]
+                            evaluator_model_id = evaluator_config["evaluator_model_id"]
+                            evaluator_prompt = evaluator_config["evaluator_prompt"]
+                            possible_labels = evaluator_config["possible_labels"]
                         
+                        # Get the model response for this job
                         async with app.state.pool.acquire() as conn:
                             model_output = await conn.fetchrow(
                                 """
@@ -202,7 +264,8 @@ class ExperimentWorker:
                                 """, row["id"]
                             )
                             model_response = model_output["model_response"]
-                            
+                        
+                        # Send the model response to be evaluated    
                         try:
                             evaluator_response = await evaluate_response(
                                 evaluator_model_id,
@@ -213,7 +276,11 @@ class ExperimentWorker:
                                 row["target_response"]
                             )
                         except Exception as e:
-                            print(f"{self.name} job failed: {e}")
+                            logger.error(
+                                f"[{self.name}] Executing model response evaluated failed. "
+                                f"{str(e)} "
+                                f"View job error log for more details."
+                            )
                             error_log = json.dumps([{
                                 "time": datetime.now().isoformat(),
                                 "error": str(e),
@@ -230,8 +297,12 @@ class ExperimentWorker:
                                     error_log,
                                     row["id"]
                                 )
+                        # If evaluation was successful, mark job as completed
                         else:
-                            print(f"{self.name}: job completed")
+                            logger.info(
+                                f"[{self.name}] Executing model response evaluation successful. "
+                                f"Updating job status to completed."
+                            )
                             async with app.state.pool.acquire() as conn:
                                 await conn.execute(
                                     """
@@ -246,9 +317,15 @@ class ExperimentWorker:
                                     evaluator_response["eval_justification"],
                                     evaluator_response["usage"],
                                     row["id"]
-                                )                        
+                                )
+            # Raises when a worker task is cancelled
+            except asyncio.CancelledError as e:
+                logger.info(f"[{self.name}] Worker shutting down.")
+                raise
+            
+            # Catch any DB related exceptions                            
             except Exception as e:
-                print(e)
+                logger.error(f"[{self.name}] {str(e)}")
                                     
 @dataclass
 class PromptWorker:
@@ -268,16 +345,14 @@ class PromptWorker:
     usage: List[float]
     errors: List[str]
     request: PromptGenerationRequest
-    # max_retries: int
     
     async def run(self) -> None:
-        """While jobs are available, pull one from the queue and run it.
-        """
+        # While jobs are available, pull one from the queue and run it
         while True:
             n = await self.queue.get()
-            print(f"Worker {self.name} taking job {n}")
+            logger.info(f"[{self.name}] Executing job n={n}.")
             try:
-                result = await asyncio.wait_for(generate_prompts(self.request, n), timeout=120)
+                result = await generate_prompts(self.request, n)
                 for _, prompt in result["prompts"].items():
                     if self.request.system_prompt is not None:
                         self.results.append({"system": self.request.system_prompt,"user": prompt})
@@ -285,13 +360,9 @@ class PromptWorker:
                         self.results.append({"user": prompt})
                     
                 self.usage.append(float(result["usage"]))
-            except asyncio.TimeoutError as e:
-                msg = f"[{self.name}] exited with error: Timeout error."
-                print(msg)
-                self.errors.append({"worker": self.name, "code": 504, "message": "Request timed out."})
             except Exception as e:
-                msg = f"[{self.name}] exited with error: {repr(e)}"
-                print(msg)
+                logger.error(f"[{self.name}] Worker exited with error: {repr(e)}")     
+                # Parse error for additional metadata (present for provider errors and moderation errors)
                 detail = None
                 try:
                     error_props = e.detail["error"]
@@ -305,7 +376,7 @@ class PromptWorker:
 
                 self.errors.append({"worker": self.name, "code": e.status_code, "message": detail})
             finally:
-                print(f"worker {self.name} done")
+                logger.info(f"[{self.name}] Worker done.")
                 self.queue.task_done()
     
 def build_prompt_schema(n: int) -> dict:
@@ -342,17 +413,38 @@ def build_prompt_schema(n: int) -> dict:
 
 @retry_with_backoff()    
 async def generate_response(
-    model_id: str, 
+    model_id: str,
+    model_config: dict,
     user_prompt: str, 
-    system_prompt: str = None
-    ) -> dict:
+    system_prompt: str = None) -> dict:
+    """Generates a response from the specified model using the provided prompt.
+
+    Args:
+        model_id (str): OpenRouter model ID.
+        model_config (dict): Supported parameter overrides for this model.
+        user_prompt (str): The prompt to send to the model
+        system_prompt (str, Optional): Optional system prompt to include with the user prompt.
+
+    Returns:
+        dict: Response with model response and usage cost of this request.
+    """
     
     messages = (
         [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         if system_prompt
         else [{"role": "user", "content": user_prompt}]
     )
-
+    
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "usage": {"include": True}
+    }
+    
+    # If the user provided values for supported parameters, add them to the request
+    for param, val in model_config.items():
+        payload[param] = val
+ 
     try:
         r = await app.state.http.post(
             url="/chat/completions",
@@ -360,11 +452,7 @@ async def generate_response(
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": model_id,
-                "messages": messages,
-                "usage": {"include": True}
-            }
+            json=payload
         )
         r.raise_for_status()
         data = r.json()
@@ -391,8 +479,24 @@ async def evaluate_response(
     evaluator_prompt: str,
     possible_labels: List[str],
     model_response: str,
-    target_response: str = None
-    ) -> dict:
+    target_response: str = None) -> dict:
+    """Sends a model response to the evaluator model to get a classification (with justification) back.
+    If the evaluator has type structured, the response is a JSON object with required fields 'label' and
+    'justification'. If the evaluator has type free, it will be instructed to return a response with special
+    tags that are parsed to get the label and justification.
+
+    Args:
+        evaluator_model_id (str): The OpenRouter model id for the evaluator model.
+        evaluator_type (Literal['structured', 'free']): The evaluator type. Either 'structured' or 'free'.
+        evaluator_prompt (str): The criteria to be used by the evaluator.
+        possible_labels (List[str]): The possible labels the evaluator can classify a response as.
+        model_response (str): The model response to evaluate.
+        target_response (str, Optional): Optional ground truth response to compare model response against.
+
+
+    Returns:
+        dict: Response with evaluation label, justification, and usage cost of this request.
+    """    
 
     user_message = (
         f"{evaluator_prompt}\nMODEL OUTPUT TO EVALUATE:\n{model_response}"
@@ -425,6 +529,7 @@ async def evaluate_response(
         "usage": {"include": True},
     }
     
+    # If the evaluator is structured, specify response format otherwise ask model to use special tags
     if evaluator_type == "structured":
         label_description = f"The classifcation label you have chosen for this sample. Must be one of {possible_labels}"
         evaluator_schema = {
@@ -466,12 +571,15 @@ async def evaluate_response(
         content = data["choices"][0]["message"]["content"]
         usage = data["usage"]["cost"]
         
+        # For structured responses, parse JSON object for required fields
         if evaluator_type == "structured":
             eval_result = json.loads(content)
             label = eval_result["label"]
             justification = eval_result["justification"]
             if label not in possible_labels:
                 raise ValueError(f"Label '{label}' not in allowed set {possible_labels}.")
+        
+        # For free responses, use regex to parse text response for special tags
         else:
             label_pattern = r"<label>(.*?)</label>"
             justification_pattern = r"<justification>(.*?)</justification>"
@@ -514,7 +622,7 @@ async def generate_prompts(
         n (int): Number of prompts to generate.
 
     Returns:
-        dict: Dictionary with generated user prompts and usage cost of this request.
+        dict: Response with generated user prompts and usage cost of this request.
     """
     prompt_schema = build_prompt_schema(n)
     payload = {
@@ -626,7 +734,6 @@ async def check_key() -> dict:
 async def fetch_prompts(
     request: PromptGenerationRequest,
     n: int = Query(description="Number of prompts to generate", le=200)) -> dict:
-    # max_retries: int = Query(description="Number of times to retry failed jobs", ge=0, le=5)):
     """Create prompt generation job. Splits the requested number of prompts into batches, assigns them to
     workers, and aggregates results.
 
@@ -638,27 +745,31 @@ async def fetch_prompts(
         dict: JSON response object with generated user prompts, total number of prompts created, 
         and usage cost of this request.
     """
+    
+    # Split requested prompts into batches
     max_prompts_per_request = 10
     batches = [max_prompts_per_request] * (n // max_prompts_per_request)
     if n % max_prompts_per_request:
         batches.append(n % max_prompts_per_request)
         
-    queue = asyncio.Queue()
-    
     results, usage, errors = [], [], []
+    queue = asyncio.Queue()
 
+    # Put each batch size into task queue
     for b in batches:
-        print("Adding job to queue")
         await queue.put(b)
     
     max_workers = 10
     n_workers = min(len(batches), max_workers) 
+    
+    # Create workers that will pull tasks from the queue and execute
     workers = [
         asyncio.create_task(
             PromptWorker(f"prompt_worker_{i}", queue, results, usage, errors, request).run()
         ) for i in range(n_workers)
     ]
     
+    # Wait for all tasks in the queue to be executed, then cancel workers
     await queue.join()
     for w in workers:
         w.cancel()
@@ -674,47 +785,61 @@ async def fetch_prompts(
         return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage), "errors": errors})
 
     return JSONResponse(content={"items": results, "total": len(results), "usage": sum(usage)})
-    
-@app.get("/experiments/start")
-async def start_experiment(): 
-# @app.post("/experiments/start")
-# async def start_experiment(request: ExperimentRequest):
-#     with open("experiment_request.json", "w") as f:
-#         json.dump(request.model_dump(exclude_none=True), f, indent=2)
-    
-    with open("experiment_request.json") as f:
-        data = json.load(f)
-        request = ExperimentRequest(**data)
+ 
+@app.post("/experiments/start")
+async def start_experiment(request: ExperimentRequest) -> dict:
+    """Start a new experiment.
+
+    Args:
+        request (ExperimentRequest): request body with experiment configuration.
+
+    Returns:
+        dict: Response with ID of the created experiment.
+    """
 
     dataset_json = [row.model_dump(exclude_none=True) for row in request.dataset]
     models_json = request.model_configs
-    evaluator_model_id = request.evaluator_model_id
     evaluator_json = request.evaluator_config.model_dump(exclude_none=True)
 
     async with app.state.pool.acquire() as conn:
         try:
+            # Put new experiment in the experiments table
             async with conn.transaction():
                 experiment_id = await conn.fetchval(
                     """
-                    INSERT INTO experiments (dataset, models, evaluator_model_id, evaluator_type, evaluator_config)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO experiments (dataset, models, evaluator_type, evaluator_config)
+                    VALUES ($1, $2, $3, $4)
                     RETURNING id
                     """,
                     json.dumps(dataset_json),
                     json.dumps(models_json),
-                    evaluator_model_id,
                     request.evaluator_type,
                     json.dumps(evaluator_json),
                 )
 
+                # Break experiment into jobs and add to jobs table
                 await conn.executemany(
                     """
-                    INSERT INTO jobs (experiment_id, model_id, job_status, user_prompt, system_prompt, target_response)
-                    VALUES ($1, $2, 'pending', $3, $4, $5)
+                    INSERT INTO jobs (
+                        experiment_id, 
+                        model_id, 
+                        model_config, 
+                        job_status, 
+                        user_prompt, 
+                        system_prompt, 
+                        target_response
+                    )
+                    VALUES ($1, $2, $3, 'pending', $4, $5, $6)
                     """, [
-                    (experiment_id, model_id, row["user"], row.get("system"), row.get("target"))
+                    (
+                        experiment_id, model_id, 
+                        json.dumps(model_config), 
+                        row["user"], 
+                        row.get("system"), 
+                        row.get("target")
+                    )
                     for row in dataset_json
-                    for model_id in models_json.keys()
+                    for model_id, model_config in models_json.items()
                 ])
 
         except Exception as e:
