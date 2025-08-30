@@ -66,6 +66,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Initialized HTTP client for OpenRouter base_url={base_url}.")
     app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=max_pool_size)
     logger.info(f"Created DB connection pool (max_size={max_pool_size}).")
+    # Event for temporarily pausing the experiment workers
+    app.state.pause_work = asyncio.Event()
     workers = [
         asyncio.create_task(ExperimentWorker(f"ExperimentWorker{i+1}").run()) for i in range(n_workers)
     ]
@@ -153,6 +155,10 @@ class ExperimentWorker:
         sleep = self.min_sleep
         logger.info(f"[{self.name}] Worker is ready.")
         while True:
+            # Sleep if work is paused
+            if app.state.pause_work.is_set():
+                logger.info(f"[{self.name}] Pausing work.")
+                await asyncio.sleep(1)
             try:
                 # Grab a job with pending work from the DB and mark it as running
                 async with app.state.pool.acquire() as conn:
@@ -190,7 +196,6 @@ class ExperimentWorker:
                                 row["user_prompt"],
                                 row["system_prompt"]
                             )
-
                         # If the request failed, mark the job as failed
                         except Exception as e:
                             logger.error(
@@ -228,7 +233,7 @@ class ExperimentWorker:
                                     SET model_response = $1,
                                         usage = usage + $2,
                                         job_status = 'awaiting_eval'
-                                    WHERE id = $3
+                                    WHERE id = $3 AND job_status = 'running'
                                     """,
                                     model_response["response"],
                                     model_response["usage"],
@@ -311,7 +316,7 @@ class ExperimentWorker:
                                         eval_justification = $2,
                                         usage = usage + $3,
                                         job_status = 'completed'
-                                    WHERE id = $4
+                                    WHERE id = $4 AND job_status = 'running'
                                     """,
                                     evaluator_response["eval_label"],
                                     evaluator_response["eval_justification"],
@@ -847,6 +852,107 @@ async def start_experiment(request: ExperimentRequest) -> dict:
 
     return {"experiment_id": experiment_id}
 
-@app.get("experiments/{experiment_id}/status")
+@app.get("/experiments/{experiment_id}/status")
 async def check_experiment_status(experiment_id: int):
+    """Check the status of an experiment.
+
+    Args:
+        experiment_id (int): ID of the experiment to check.
+        
+    Returns:
+        dict: Response with job counts by status and total usage cost so far.
+    """
+    async with app.state.pool.acquire() as conn:
+        exp = await conn.fetchrow("SELECT id FROM experiments WHERE id=$1", experiment_id)
+        if exp is None:
+            raise HTTPException(status_code=404, detail=f"Experiment with ID={experiment_id} not found.")
+        rows = await conn.fetch("""
+            SELECT job_status, COUNT(*) AS n
+            FROM jobs
+            WHERE experiment_id = $1
+            GROUP BY job_status
+            """, experiment_id
+        )
+        counts = {r["job_status"]: r["n"] for r in rows}
+        pending = counts.get("pending", 0)
+        running = counts.get("running", 0)
+        awaiting_eval = counts.get("awaiting_eval", 0)
+        completed = counts.get("completed", 0)
+        failed = counts.get("failed", 0)
+        cancelled = counts.get("cancelled", 0)
+        total = sum(counts.values())
+        
+        usage = await conn.fetchrow("""
+            SELECT COALESCE(SUM(usage), 0) AS usage_sum
+            FROM jobs
+            WHERE experiment_id = $1
+            """, experiment_id
+        )
+        usage_so_far = float(usage["usage_sum"] or 0)
+        
+    return {
+        "pending": pending,
+        "running": running,
+        "awaiting_eval": awaiting_eval,
+        "completed": completed,
+        "failed": failed,
+        "cancelled": cancelled,
+        "total_jobs": total,
+        "total_usage": usage_so_far
+    }
+
+@app.post("/experiments/{experiment_id}/cancel")
+async def cancel_experiment(experiment_id: int) -> None:
+    """Cancel an experiment.
+
+    Args:
+        experiment_id (int): ID of the experiment to cancel.
+    """
+    async with app.state.pool.acquire() as conn:
+        exp = await conn.fetchrow("SELECT id FROM experiments WHERE id=$1", experiment_id)
+    if exp is None:
+        raise HTTPException(status_code=404, detail=f"Experiment with ID={experiment_id} not found.")
+    
+    # Tell the workers to pause temporarily
+    app.state.pause_work.set()
+
+    # Set all jobs that haven't finished or failed to cancel
+    async with app.state.pool.acquire() as conn:
+        # Cancel anything not yet being processed
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET job_status = 'cancelled'
+            WHERE experiment_id = $1
+              AND job_status IN ('pending', 'running', 'awaiting_eval')
+            """,
+            experiment_id,
+        )
+    # Wait, and then unpause
+    await asyncio.sleep(5)
+    app.state.pause_work.clear()
     return
+
+@app.get("/experiments/{experiment_id}/export")
+async def export_experiment_data(experiment_id: int) -> dict:
+    """Export all of the job data for the specified experiment.
+
+    Args:
+        experiment_id (int): ID of the experiment to retrieve.
+    
+    Returns:
+        dict: All of the job rows for this experiment
+    """
+    async with app.state.pool.acquire() as conn:
+        exp = await conn.fetchrow("SELECT id FROM experiments WHERE id=$1", experiment_id)
+        if exp is None:
+            raise HTTPException(status_code=404, detail=f"Experiment with ID={experiment_id} not found.")
+        
+        rows = await conn.fetch(
+            """
+            SELECT * FROM jobs WHERE experiment_id = $1 ORDER BY id
+            """, experiment_id
+        )
+        print(rows)
+        
+    return {"data": [dict(r) for r in rows]}
