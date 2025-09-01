@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import requests
@@ -5,12 +6,12 @@ import json
 import time
 import yaml
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = os.getenv("BASE_URL", "http://api:8000")
 UNUSED_PARAMS = ["tool_choice", "tools", "include_reasoning", "logprobs", "top_logprobs"]
 
 def check_key():
     """Verify the OpenRouter API key is valid."""
-    key = requests.get(url=f"{BASE_URL}/key/")
+    key = requests.get(url=f"{BASE_URL}/key")
     if key.ok:
         return True, ""
     if key.status_code == 401:
@@ -20,12 +21,12 @@ def check_key():
             err = key.json()
         except ValueError:
             err = key.text
-        return False, f"OpenRouter API key check failed ({r.status_code}): {err}"
+        return False, f"OpenRouter API key check failed ({key.status_code}): {err}"
 
 @st.cache_data
 def get_model_list():
     """Get available models from openrouter and cache them."""
-    res = requests.get(url=f"{BASE_URL}/models/")
+    res = requests.get(url=f"{BASE_URL}/models")
     models = json.loads(res.content)
     models_df = pd.json_normalize(models["data"])
     models_df = models_df[models_df["id"] != "openrouter/auto"]
@@ -44,6 +45,7 @@ with open("supported_params.yml", "r") as f:
 
 # Initialize session state variables
 session_state_defaults = {
+    "valid_key": False,
     "saved_model_ids": [],
     "experiment_data": None,
     "generated_prompts": None,
@@ -60,9 +62,15 @@ for key, value in session_state_defaults.items():
         st.session_state[key] = value
 
 st.title("LLM Behavior Tester")
-key_ok, msg = check_key()
-if not key_ok:
-    st.error(msg)
+# Validate OpenRouter API key
+if "valid_key" not in st.session_state:
+    key_ok, msg = check_key()
+    if not key_ok:
+        st.error(msg)
+        st.stop()
+
+    st.session_state.valid_key = True
+
 st.subheader("Step 1. Select the models you want to test")
 models_df = get_model_list()
 
@@ -95,7 +103,7 @@ display_df = display_df.drop(columns=[
 ])
 display_models = st.dataframe(
     display_df,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
@@ -222,7 +230,7 @@ if st.session_state.saved_model_ids:
                 if system_prompt_toggle and system_prompt:
                     prompt_req_body["system_prompt"] = system_prompt
                 prompt_res = requests.post(
-                    url=f"{BASE_URL}/generate/prompts/", 
+                    url=f"{BASE_URL}/generate/prompts", 
                     json=prompt_req_body,
                     params={
                         "n": num_prompts

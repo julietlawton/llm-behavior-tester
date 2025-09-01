@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import requests
 import altair as alt
+import os
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = os.getenv("BASE_URL", "http://api:8000")
 
 @st.cache_data
 def convert_for_download(df):
@@ -63,7 +64,7 @@ if len(models) > 1:
             horizontal=True,
             stack=stack,
             height=400,
-            use_container_width=True,
+            width="stretch",
         )
 
 # For each model, create a bar chart for its results and a widget to sample responses by category
@@ -94,14 +95,14 @@ for id in models:
             )
 
         )
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
         # Display metrics underneath chart
         metric_cols = st.columns(len(possible_labels))
         for i, metric_col in enumerate(metric_cols):
             val = counts["percent"][counts["label"] == possible_labels[i]]
             percent = val.iloc[0] if not val.empty else 0
-            metric_col.metric(possible_labels[i], f"{percent}%")
+            metric_col.metric(possible_labels[i], f"{percent:.2f}%")
     
     # Response sampler   
     with col2:
@@ -131,7 +132,7 @@ for id in models:
 # View and export full experiment data           
 st.divider()
 if st.toggle("View experiment data"):
-    st.dataframe(exp_df, use_container_width=True)
+    st.dataframe(exp_df, width="stretch")
     
 csv = convert_for_download(exp_df)
 st.download_button(

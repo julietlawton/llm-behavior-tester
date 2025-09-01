@@ -1,3 +1,6 @@
-.env
+*.env
 .venv/
 __pycache__/
+api/apienv/
+api/__pycache__/
+ui/uienv/
