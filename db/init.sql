@@ -20,5 +20,7 @@ CREATE TABLE jobs (
     eval_justification TEXT,
     usage NUMERIC(12, 4) DEFAULT 0,
     error_log JSONB DEFAULT '[]'::jsonb,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    start_time timestamp,
+    end_time timestamp
 );

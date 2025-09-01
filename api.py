@@ -44,7 +44,6 @@ def retry_with_backoff(retries: int = 3):
                 except HTTPException as e:
                     if e.status_code not in {408, 429, 500, 502, 503, 504} or attempt == retries:
                         raise
-                    
                     sleep = min(initial_sleep * (2 ** attempt - 1), max_sleep)
                     sleep += random.uniform(0, sleep * 0.1)
                     await asyncio.sleep(sleep)
@@ -66,8 +65,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Initialized HTTP client for OpenRouter base_url={base_url}.")
     app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=max_pool_size)
     logger.info(f"Created DB connection pool (max_size={max_pool_size}).")
-    # Event for temporarily pausing the experiment workers
-    app.state.pause_work = asyncio.Event()
+    app.state.cancelled_experiments = set()
     workers = [
         asyncio.create_task(ExperimentWorker(f"ExperimentWorker{i+1}").run()) for i in range(n_workers)
     ]
@@ -155,10 +153,6 @@ class ExperimentWorker:
         sleep = self.min_sleep
         logger.info(f"[{self.name}] Worker is ready.")
         while True:
-            # Sleep if work is paused
-            if app.state.pause_work.is_set():
-                logger.info(f"[{self.name}] Pausing work.")
-                await asyncio.sleep(1)
             try:
                 # Grab a job with pending work from the DB and mark it as running
                 async with app.state.pool.acquire() as conn:
@@ -172,7 +166,7 @@ class ExperimentWorker:
                             LIMIT 1
                         )
                         UPDATE jobs j
-                        SET job_status = 'running'
+                        SET job_status = 'running', start_time = NOW()
                         FROM pending_job
                         WHERE j.id = pending_job.id
                         RETURNING j.*, pending_job.job_status AS prev_state;
@@ -185,8 +179,19 @@ class ExperimentWorker:
                     sleep = min(self.max_sleep, sleep*2)
                 else:
                     sleep = self.min_sleep
+                    # If this experiment was marked for cancellation, cancel the job
+                    if row["experiment_id"] in app.state.cancelled_experiments:
+                        logger.info(f"[{self.name}] Cancelling job {row["id"]}.")
+                        async with app.state.pool.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE jobs SET job_status='cancelled', end_time=NOW() 
+                                WHERE id=$1 AND job_status='running'
+                                """, row["id"]
+                            )
+                        
                     # If the job is marked as pending, generate a model response for the prompt
-                    if row["prev_state"] == "pending":
+                    elif row["prev_state"] == "pending":
                         logger.info(f"[{self.name}] Executing model response generation.")
                         try:
                             model_config = json.loads(row["model_config"])
@@ -213,7 +218,7 @@ class ExperimentWorker:
                                     """
                                     UPDATE jobs
                                     SET error_log = error_log || $1::jsonb,
-                                        job_status = 'failed'
+                                        job_status = 'failed', end_time = NOW()
                                     WHERE id = $2
                                     """,
                                     error_log,
@@ -296,7 +301,7 @@ class ExperimentWorker:
                                     """
                                     UPDATE jobs
                                     SET error_log = error_log || $1::jsonb,
-                                        job_status = 'failed'
+                                        job_status = 'failed', end_time = NOW()
                                     WHERE id = $2
                                     """,
                                     error_log,
@@ -315,7 +320,8 @@ class ExperimentWorker:
                                     SET eval_label = $1,
                                         eval_justification = $2,
                                         usage = usage + $3,
-                                        job_status = 'completed'
+                                        job_status = 'completed',
+                                        end_time = NOW()
                                     WHERE id = $4 AND job_status = 'running'
                                     """,
                                     evaluator_response["eval_label"],
@@ -770,7 +776,7 @@ async def fetch_prompts(
     # Create workers that will pull tasks from the queue and execute
     workers = [
         asyncio.create_task(
-            PromptWorker(f"prompt_worker_{i}", queue, results, usage, errors, request).run()
+            PromptWorker(f"PromptWorker{i+1}", queue, results, usage, errors, request).run()
         ) for i in range(n_workers)
     ]
     
@@ -881,6 +887,7 @@ async def check_experiment_status(experiment_id: int):
         failed = counts.get("failed", 0)
         cancelled = counts.get("cancelled", 0)
         total = sum(counts.values())
+        finished = (total == completed + failed + cancelled)
         
         usage = await conn.fetchrow("""
             SELECT COALESCE(SUM(usage), 0) AS usage_sum
@@ -898,7 +905,8 @@ async def check_experiment_status(experiment_id: int):
         "failed": failed,
         "cancelled": cancelled,
         "total_jobs": total,
-        "total_usage": usage_so_far
+        "total_usage": usage_so_far,
+        "finished": finished
     }
 
 @app.post("/experiments/{experiment_id}/cancel")
@@ -913,24 +921,8 @@ async def cancel_experiment(experiment_id: int) -> None:
     if exp is None:
         raise HTTPException(status_code=404, detail=f"Experiment with ID={experiment_id} not found.")
     
-    # Tell the workers to pause temporarily
-    app.state.pause_work.set()
-
-    # Set all jobs that haven't finished or failed to cancel
-    async with app.state.pool.acquire() as conn:
-        # Cancel anything not yet being processed
-        await conn.execute(
-            """
-            UPDATE jobs
-            SET job_status = 'cancelled'
-            WHERE experiment_id = $1
-              AND job_status IN ('pending', 'running', 'awaiting_eval')
-            """,
-            experiment_id,
-        )
-    # Wait, and then unpause
-    await asyncio.sleep(5)
-    app.state.pause_work.clear()
+    # Tell the workers to cancel jobs for this experiment
+    app.state.cancelled_experiments.add(experiment_id)
     return
 
 @app.get("/experiments/{experiment_id}/export")
@@ -953,6 +945,5 @@ async def export_experiment_data(experiment_id: int) -> dict:
             SELECT * FROM jobs WHERE experiment_id = $1 ORDER BY id
             """, experiment_id
         )
-        print(rows)
         
     return {"data": [dict(r) for r in rows]}
