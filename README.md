@@ -31,7 +31,7 @@ Before getting started, you will need:
 
 1. Clone the repo
 ```bash
-git clone https://github.com/julietlawton/llm-behavior-tester.ai.git
+git clone https://github.com/julietlawton/llm-behavior-tester.git
 cd llm-behavior-tester
 ```
 
