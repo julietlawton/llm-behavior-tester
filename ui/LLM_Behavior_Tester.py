@@ -62,6 +62,7 @@ for key, value in session_state_defaults.items():
         st.session_state[key] = value
 
 st.title("LLM Behavior Tester")
+
 # Validate OpenRouter API key
 if "valid_key" not in st.session_state:
     key_ok, msg = check_key()
@@ -116,7 +117,7 @@ def _commit_selected_models():
 
 # Model picker widget
 st.multiselect(
-    "Select models",
+    "Select models:",
     options=models_df["id"].tolist(),
     key="model_picker",
     on_change=_commit_selected_models
@@ -151,7 +152,7 @@ if st.session_state.saved_model_ids:
                 user_df = st.data_editor(uploaded_df, num_rows="dynamic")
                 st.write(f"**Total items:** {len(user_df)}")
 
-                if st.button("Use this dataset", key="use_uploaded_data_button"):
+                if st.button("Use this Dataset", key="use_uploaded_data_button"):
                     # Check for any missing or invalid values before committing
                     if user_df.isna().any().any() or (user_df.map(lambda v: isinstance(v, str) and v.strip() == "").any().any()):
                         st.error("Invalid data: dataset has empty or NaN values.")
@@ -203,7 +204,7 @@ if st.session_state.saved_model_ids:
         )
         
         generated_clicked = st.button(
-            "Generate prompts", 
+            "Generate Prompts", 
             icon=":material/wand_stars:",
             disabled=st.session_state.prompt_generation_running
         )
@@ -279,7 +280,7 @@ if st.session_state.saved_model_ids:
             st.write(f"**Total items generated:** {job_metadata["total"]} **Job cost:** ${job_metadata["usage"]}")
             
             # Set generated data as the experiment data
-            if st.button("Use this dataset", key="use_generated_data_button"):
+            if st.button("Use this Dataset", key="use_generated_data_button"):
                 st.session_state.experiment_data = generated_df_edited
 
 # Experiment configuration section    

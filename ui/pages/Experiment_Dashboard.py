@@ -23,8 +23,9 @@ def fetch_experiment_data():
     else:
         st.error(f"Loading experiment data failed: {experiment_results.status_code} - {experiment_results.text}")
 
+st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
+
 st.title("Experiment Dashboard")
-st.divider()
 
 experiment_id = st.session_state.get("experiment_id")
 experiment_status = st.session_state.get("experiment_completed")
@@ -34,6 +35,7 @@ if not experiment_id or not experiment_status:
     st.info("Nothing here yet. Start an experiment to populate the dashboard.")
     st.stop()
 
+st.divider()
 # Load experiment data and filter out any jobs that failed or were cancelled
 exp_df = fetch_experiment_data()
 exp_df = exp_df.rename(columns={"id": "job_id"})
@@ -64,7 +66,7 @@ if len(models) > 1:
             horizontal=True,
             stack=stack,
             height=400,
-            width="stretch",
+            use_container_width=True,
         )
 
 # For each model, create a bar chart for its results and a widget to sample responses by category
@@ -95,7 +97,7 @@ for id in models:
             )
 
         )
-        st.altair_chart(chart, width="stretch")
+        st.altair_chart(chart, use_container_width=True)
 
         # Display metrics underneath chart
         metric_cols = st.columns(len(possible_labels))
@@ -132,7 +134,7 @@ for id in models:
 # View and export full experiment data           
 st.divider()
 if st.toggle("View experiment data"):
-    st.dataframe(exp_df, width="stretch")
+    st.dataframe(exp_df, use_container_width=True)
     
 csv = convert_for_download(exp_df)
 st.download_button(
