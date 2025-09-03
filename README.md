@@ -1,9 +1,5 @@
 # LLM Behavior Tester
-
-<table align="center"><tr><td>
-    <img width="1000" src="https://github.com/julietlawton/llm-behavior-tester/blob/34f5e41831325cb800ed2d72bf188184c9958bb7/ui/images/dashboard_screenshot.png"
- />
-</td></tr></table>
+<img width="1787" height="1049" alt="dashboard_screenshot-1" src="https://github.com/user-attachments/assets/6b8cbe4e-7d61-4cc1-9fe0-c6727429d1b6" />
 
 ## Motivation
 
